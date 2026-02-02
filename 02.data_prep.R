@@ -3,6 +3,7 @@ library(tidyverse)
 library(sf)
 library(terra)
 library(rnaturalearth)
+library(janitor)
 
 ##############################
 # Cleaning GBIF data
@@ -19,7 +20,7 @@ gbif_data <- gbif_data[!duplicated(gbif_data),]
 
 # Selecting relevant countries
 gbif_data <- gbif_data %>% 
-  filter(countryCode %in% c("IN", "BD", "MM"))
+  filter(countryCode %in% c("IN", "BD"))
 
 write_csv(gbif_data, "data/cleanedRecords_GBIF.csv")
 
@@ -32,12 +33,12 @@ rm(gbif_data)
 gbif_data <- read_csv("data/cleanedRecords_GBIF.csv")
 fb_data <- read_csv("data/dist_data_fb.csv")
 
-# Facebook data is from 2013, so we are removing GBIF data before 2012
-gbif_data <- gbif_data %>% 
-  filter(year > 2012 & year < 2025 & basisOfRecord %in% c("HUMAN_OBSERVATION", "PRESERVED_SPECIMEN"))
-
 gbif_data$order <- NULL
 colnames(gbif_data)[6] <- "order"
+
+# Facebook data is from 2013, so we are removing GBIF data before 2012
+gbif_data <- gbif_data %>% 
+  filter(basisOfRecord %in% c("HUMAN_OBSERVATION", "PRESERVED_SPECIMEN"))
 
 # Subsetting by columns
 gbif_data <- gbif_data %>% 
@@ -52,6 +53,10 @@ colnames(gbif_data)[9] <- "source"
 
 combined_data <- rbind(fb_data, gbif_data)
 
+# Facebook data is from 2013, so we are removing GBIF data before 2012
+combined_data <- combined_data %>% 
+  filter(year > 2012 & year < 2025)
+
 # Combining with species traits and IUCN status
 trait_iucn <- read_csv("data/trait.csv")
 
@@ -63,131 +68,104 @@ write_csv(trait_iucn_com, "data/com_data.csv")
 # Cleaning memory
 rm(list = ls())
 
-
 ####################################
 # Creating trait data table
-# Load and clean occurrence data
-occ <- read_csv("data/com_data.csv")
+# Load + rename trait columns
+occ_raw <- read_csv("data/com_data.csv", show_col_types = FALSE)
 
-# Define sources and create “overall” sampling frame
-occ_all <- bind_rows(
-  occ,
-  occ %>% mutate(source = "Overall")
-)
+colnames(occ_raw)[10:18] <- c("mass", "zonation", "activity", "foraging",
+                              "venom", "n_gard", "range_size", "iucn_status",
+                              "thrt_status")
+# Filter data frame
+occ <- occ_raw %>%
+  clean_names() %>%
+  select(-n_gard, -iucn_status)
 
-cs_data     <- occ_all %>% filter(source == "HUMAN_OBSERVATION") %>% mutate(source = "CS")
-fb_data     <- occ_all %>% filter(source == "Facebook")
-museum_data <- occ_all %>% filter(source == "PRESERVED_SPECIMEN") %>% mutate(source = "Museum")
-ov_data     <- occ_all %>% filter(source == "Overall")
+# Standardise sources
+occ <- occ %>%
+  filter(source %in% c("HUMAN_OBSERVATION", "Facebook", "PRESERVED_SPECIMEN")) %>%
+  mutate(source = case_when(
+    source == "HUMAN_OBSERVATION"   ~ "CS",
+    source == "PRESERVED_SPECIMEN" ~ "Museum",
+    source == "Facebook"           ~ "Facebook",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(source))
 
-# Spatial conversion and projection
-crs_proj <- "+proj=utm +zone=46 +datum=WGS84 +units=km +no_defs"
+# Make sure mass/range_size are numeric (safe if they’re already numeric)
+occ <- occ %>%
+  mutate(
+    mass = suppressWarnings(as.numeric(mass)),
+    range_size = suppressWarnings(as.numeric(range_size))
+  )
 
-to_utm <- function(df) {
-  st_as_sf(df, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326) %>%
-    st_transform(crs_proj)
-}
+# Convert to sf + filter to region
+crs_proj <- "EPSG:32646"  # UTM 46N (metres)
 
-cs_utm     <- to_utm(cs_data)
-fb_utm     <- to_utm(fb_data)
-museum_utm <- to_utm(museum_data)
-ov_utm     <- to_utm(ov_data)
+occ_sf <- st_as_sf(occ, coords = c("decimal_longitude", "decimal_latitude"), crs = 4326, remove = FALSE) %>%
+  st_transform(crs_proj)
 
-# Define study region and filter points
 countries <- ne_countries(
   scale = "large",
-  country = c("Bangladesh", "India", "Myanmar"),
+  country = c("Bangladesh", "India"),
   returnclass = "sf"
 ) %>%
   st_transform(crs_proj) %>%
   st_union() %>%
   st_sf()
 
-inside_region <- function(x) x[st_within(x, countries, sparse = FALSE), ]
+occ_sf <- occ_sf[st_within(occ_sf, countries, sparse = FALSE), ]
 
-cs_utm     <- inside_region(cs_utm)
-fb_utm     <- inside_region(fb_utm)
-museum_utm <- inside_region(museum_utm)
-ov_utm     <- inside_region(ov_utm)
-
-# Create 10 × 10 km grid (conditioned on overall data)
+# Create 10 × 10 km grid over the region
 grid <- st_make_grid(
-  st_as_sfc(st_bbox(ov_utm)),
-  cellsize = c(10, 10),
+  st_as_sfc(st_bbox(countries)),
+  cellsize = 10000,  # 10 km in metres
   square = TRUE
 ) %>%
   st_sf(grid_id = seq_along(.))
 
-# Assign points to grids
-assign_grid <- function(points) {
-  st_join(points, grid, join = st_within) %>%
-    filter(!is.na(grid_id))
-}
+# Keep only grid cells that intersect the region
+grid <- grid[lengths(st_intersects(grid, countries)) > 0, ] %>%
+  mutate(grid_id = row_number())
 
-cs_grid     <- assign_grid(cs_utm)
-fb_grid     <- assign_grid(fb_utm)
-museum_grid <- assign_grid(museum_utm)
-ov_grid     <- assign_grid(ov_utm)
+# Assign records to grids
+occ_grid <- st_join(occ_sf, grid, join = st_within) %>%
+  filter(!is.na(grid_id))
 
-# Binary grid × source presence (conditioning step)
-valid_grids <- ov_grid %>%
-  st_drop_geometry() %>%
-  distinct(grid_id)
-
-presence_df <- expand_grid(
-  grid_id = valid_grids$grid_id,
-  source  = c("CS", "Facebook", "Museum")
-) %>%
-  left_join(
-    bind_rows(
-      cs_grid     %>% st_drop_geometry() %>% distinct(grid_id) %>% mutate(source = "CS", presence = 1),
-      fb_grid     %>% st_drop_geometry() %>% distinct(grid_id) %>% mutate(source = "Facebook", presence = 1),
-      museum_grid %>% st_drop_geometry() %>% distinct(grid_id) %>% mutate(source = "Museum", presence = 1)
-    ),
-    by = c("grid_id", "source")
-  ) %>%
-  mutate(presence = replace_na(presence, 0))
-
-# Species–trait lookup table
-colnames(occ)[10:18] <- c("mass", "zonation", "activity", "foraging", 
-                          "venom", "n_gard", "range_size", "iucn_status", 
-                          "thrt_status")
-occ$n_gard <- NULL
-occ$iucn_status <- NULL
-
+# Species → trait lookup (traits are species-level)
 traits <- occ %>%
-  distinct(
-    species,
-    mass,
-    zonation,
-    activity,
-    foraging,
-    venom,
-    range_size,
-    thrt_status
-  ) %>%
-  clean_names()
+  distinct(species, mass, range_size, zonation, activity, foraging, venom, thrt_status)
 
-# Attach species to grid × source and summarise traits
-grid_species <- bind_rows(
-  cs_grid     %>% st_drop_geometry() %>% dplyr::select(grid_id, species) %>% mutate(source = "CS"),
-  fb_grid     %>% st_drop_geometry() %>% dplyr::select(grid_id, species) %>% mutate(source = "Facebook"),
-  museum_grid %>% st_drop_geometry() %>% dplyr::select(grid_id, species) %>% mutate(source = "Museum")
-) %>%
+# Build grid × source × species (species-weighted)
+grid_species <- occ_grid %>%
+  st_drop_geometry() %>%
+  select(grid_id, source, species) %>%
+  filter(!is.na(species)) %>%
+  distinct(grid_id, source, species) %>%     # <- each species counts once per grid × source
   left_join(traits, by = "species")
 
-# Extract grid-level environmental covariates
-built <- rast("data/built_areas_crop.tif")
-hfp   <- rast("data/hfp_crop.tif")
-clim  <- rast("data/climate.tif")
+# Diagnostics / intensity measures
+n_records <- occ_grid %>%
+  st_drop_geometry() %>%
+  count(grid_id, source, name = "n_records")
 
+n_species <- grid_species %>%
+  count(grid_id, source, name = "n_species")
+
+# Environmental covariates per grid
+built <- rast("data/built_areas_crop.tif")
+names(built) <- "built_areas"
+hfp   <- rast("data/hfp_crop.tif")
+names(hfp)   <- "hfp"
+clim  <- rast("data/climate.tif")           # keeps whatever names are in that raster
+
+# Merge rasters
 vars <- c(built, hfp, clim)
 
-grid_vect <- vect(grid) %>%
-  project(crs(vars))
+# Change crs
+grid_vect <- vect(grid) %>% project(crs(vars))
 
-terraOptions(threads = parallel::detectCores() - 4)
-
+# Extract grid ID based information
 grid_covariates <- terra::extract(
   vars,
   grid_vect,
@@ -198,53 +176,86 @@ grid_covariates <- terra::extract(
   mutate(grid_id = grid$grid_id) %>%
   select(-ID)
 
-# Merge with the original dataset
-grid_merge <- grid_species %>%
-  left_join(grid_covariates, by = "grid_id")
-
 # Export output
-write_csv(grid_merge, "output/grid_merge.csv")
+write_csv(grid_covariates, "data/grid_covariates.csv")
 
-# Continuous variables
-cont_vars <- grid_merge %>%
+# Trait summaries per grid × source (means across species within each grid)
+# Continuous traits: mean across SPECIES in each grid × source
+cont_vars <- grid_species %>%
   group_by(grid_id, source) %>%
   summarise(
-    mean_mass = mean(mass, na.rm = TRUE),
+    mean_mass       = mean(mass, na.rm = TRUE),
     mean_range_size = mean(range_size, na.rm = TRUE),
-    mean_built_areas = mean(built_areas),
-    mean_hfp = mean(hfp),
-    mean_temp = mean(mean_temp),
-    mean_rain = mean(annual_precip),
-    mean_elev = mean(elevation),
     .groups = "drop"
   )
 
-# Categorical traits (proportions)
-cat_props <- function(df, var, prefix) {
-  df %>%
-    filter(!is.na(.data[[var]])) %>%
-    count(grid_id, source, .data[[var]]) %>%
-    group_by(grid_id, source) %>%
-    mutate(prop = n / sum(n)) %>%
-    select(-n) %>%
-    pivot_wider(
-      names_from = all_of(var),
-      values_from = prop,
-      values_fill = 0,
-      names_prefix = prefix
-    )
-}
+# Categorical traits: proportion of SPECIES in each category within grid × source
+activity_props <- grid_species %>%
+  filter(!is.na(activity)) %>%
+  count(grid_id, source, activity) %>%
+  group_by(grid_id, source) %>%
+  mutate(prop = n / sum(n)) %>%
+  select(-n) %>%
+  pivot_wider(names_from = activity, values_from = prop, values_fill = 0, names_prefix = "activity_")
 
-trait_grid_summary <- cont_vars %>%
-  left_join(cat_props(grid_merge, "activity", "activity_"), by = c("grid_id", "source")) %>%
-  left_join(cat_props(grid_merge, "zonation", "zonation_"), by = c("grid_id", "source")) %>%
-  left_join(cat_props(grid_merge, "foraging", "foraging_"), by = c("grid_id", "source")) %>%
-  left_join(cat_props(grid_merge, "venom", "venom_"), by = c("grid_id", "source")) %>%
-  left_join(cat_props(grid_merge, "thrt_status", "threat_"), by = c("grid_id", "source"))
+zonation_props <- grid_species %>%
+  filter(!is.na(zonation)) %>%
+  count(grid_id, source, zonation) %>%
+  group_by(grid_id, source) %>%
+  mutate(prop = n / sum(n)) %>%
+  select(-n) %>%
+  pivot_wider(names_from = zonation, values_from = prop, values_fill = 0, names_prefix = "zonation_")
 
-# Join presence and traits
-analysis_df <- presence_df %>%
-  left_join(trait_grid_summary, by = c("grid_id", "source"))
+foraging_props <- grid_species %>%
+  filter(!is.na(foraging)) %>%
+  count(grid_id, source, foraging) %>%
+  group_by(grid_id, source) %>%
+  mutate(prop = n / sum(n)) %>%
+  select(-n) %>%
+  pivot_wider(names_from = foraging, values_from = prop, values_fill = 0, names_prefix = "foraging_")
 
-# Export output
-write_csv(analysis_df, "output/analysis_df.csv")
+venom_props <- grid_species %>%
+  filter(!is.na(venom)) %>%
+  count(grid_id, source, venom) %>%
+  group_by(grid_id, source) %>%
+  mutate(prop = n / sum(n)) %>%
+  select(-n) %>%
+  pivot_wider(names_from = venom, values_from = prop, values_fill = 0, names_prefix = "venom_")
+
+threat_props <- grid_species %>%
+  filter(!is.na(thrt_status)) %>%
+  count(grid_id, source, thrt_status) %>%
+  group_by(grid_id, source) %>%
+  mutate(prop = n / sum(n)) %>%
+  select(-n) %>%
+  pivot_wider(names_from = thrt_status, values_from = prop, values_fill = 0, names_prefix = "threat_")
+
+trait_grid_summary <- n_species %>%
+  left_join(n_records,       by = c("grid_id", "source")) %>%
+  left_join(cont_vars,       by = c("grid_id", "source")) %>%
+  left_join(activity_props,  by = c("grid_id", "source")) %>%
+  left_join(zonation_props,  by = c("grid_id", "source")) %>%
+  left_join(foraging_props,  by = c("grid_id", "source")) %>%
+  left_join(venom_props,     by = c("grid_id", "source")) %>%
+  left_join(threat_props,    by = c("grid_id", "source"))
+
+# Final analysis table (grid × source, fill zeros for missing source)
+valid_grids <- occ_grid %>%
+  st_drop_geometry() %>%
+  distinct(grid_id)
+
+analysis_df <- expand_grid(
+  grid_id = valid_grids$grid_id,
+  source  = c("CS", "Facebook", "Museum")
+) %>%
+  left_join(trait_grid_summary, by = c("grid_id", "source")) %>%
+  left_join(grid_covariates,    by = "grid_id") %>%
+  mutate(
+    n_species = replace_na(n_species, 0L),
+    n_records = replace_na(n_records, 0L)
+  )
+
+# Export data
+write_csv(grid_species,        "output/grid_species_speciesweighted.csv")
+write_csv(trait_grid_summary,  "output/trait_grid_summary_speciesbased.csv")
+write_csv(analysis_df,         "output/analysis_df_speciesbased.csv")
