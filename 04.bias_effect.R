@@ -30,13 +30,10 @@ write_csv(analysis_long, "output/analysis_long.csv")
 
 analysis_long2 <- analysis_long %>%
   mutate(source = factor(source, levels = c("CS", "Facebook", "Museum"))) %>%
-  ### NEW: drop undefined trait rows (n_species==0 -> trait NAs)
   filter(n_species > 0, !is.na(value)) %>%
-  ### NEW: drop predictors with no variation (these cause NA coefficients/p-values)
   group_by(predictor) %>%
   filter(n_distinct(value) > 1) %>%
   ungroup() %>%
-  ### NEW: stabilise proportion predictors using logit transform (still simple)
   mutate(
     is_prop = str_detect(predictor, "^(activity|zonation|foraging|venom|threat)_"),
     value_t = if_else(
@@ -46,6 +43,7 @@ analysis_long2 <- analysis_long %>%
     )
   )
 
+#########################################
 # Fit linear models (one per predictor)
 lm_results <- analysis_long2 %>%
   group_by(predictor) %>%
@@ -69,7 +67,6 @@ bias_df <- lm_results %>%
     significance = ifelse(p.value < 0.05, "Significant", "Not significant")
   ) %>%
   select(predictor, source, bias, bias_low, bias_high, p_value, significance) %>%
-  ### NEW: remove any remaining NAs so they don’t show in plot/legend
   filter(!is.na(bias), !is.na(significance), source %in% c("Facebook", "Museum")) %>%
   mutate(
     significance = factor(significance, levels = c("Not significant", "Significant")),
@@ -189,5 +186,147 @@ ggplot(
   geom_hline(data = hline_df, aes(yintercept = y + 0.5), inherit.aes = FALSE,
              linetype = "dashed", colour = "grey90", linewidth = 0.3)
 
-# Export output
+# Export plot
 ggsave("output/figures/bias.png")
+
+############################################
+# Clean predictor labels and standardise values within each predictor
+plot_df <- analysis_long2 %>%
+  group_by(predictor) %>%
+  mutate(value_z = as.numeric(scale(value_t))) %>%
+  ungroup() %>%
+  mutate(
+    predictor_clean = predictor %>%
+      str_replace_all("_", " ") %>%
+      str_replace_all("&", " & "),
+    predictor_clean = case_when(
+      predictor_clean == "hfp"           ~ "mean hfp",
+      predictor_clean == "built areas"   ~ "mean built areas",
+      predictor_clean == "annual precip" ~ "mean rain",
+      predictor_clean == "elevation"     ~ "mean elev",
+      TRUE ~ predictor_clean
+    )
+  )
+
+# Custom predictor order
+predictor_order <- c(
+  "activity Cathemeral",
+  "activity Crepuscular",
+  "activity Diurnal",
+  "activity Nocturnal",
+  "foraging Active foraging",
+  "foraging Mixed",
+  "foraging Sit and Wait",
+  "mean mass",
+  "mean range size",
+  "venom Yes",
+  "venom No",
+  "zonation Aquatic",
+  "zonation Arboreal",
+  "zonation Cryptic",
+  "zonation Fossorial",
+  "zonation Saxicolous",
+  "zonation Semi-Aquatic",
+  "zonation Terrestrial",
+  "zonation Arboreal & Saxicolous",
+  "zonation Arboreal & Terrestrial",
+  "zonation Fossorial & Terrestrial",
+  "zonation Arboreal & Saxicolous & Terrestrial",
+  "threat Threatened",
+  "threat Non-threatened",
+  "threat Data Deficient",
+  "threat Not Evaluated",
+  "mean elev",
+  "mean temp",
+  "mean rain",
+  "mean built areas",
+  "mean hfp"
+)
+
+plot_df <- plot_df %>%
+  filter(predictor_clean %in% predictor_order) %>%
+  mutate(
+    predictor_clean = factor(predictor_clean, levels = rev(predictor_order)),
+    source = factor(source, levels = c("CS", "Facebook", "Museum"))
+  )
+
+# Summarise weighted mean and approximate 95% CI per source per predictor
+source_summary <- plot_df %>%
+  group_by(predictor_clean, source) %>%
+  summarise(
+    n_cells = n(),
+    total_species = sum(n_species, na.rm = TRUE),
+    mean_z = weighted.mean(value_z, w = n_species, na.rm = TRUE),
+    eff_n = sum(n_species, na.rm = TRUE)^2 / sum(n_species^2, na.rm = TRUE),
+    w_var = sum(n_species * (value_z - mean_z)^2, na.rm = TRUE) /
+      sum(n_species, na.rm = TRUE),
+    se = sqrt(w_var / eff_n),
+    lower = mean_z - 1.96 * se,
+    upper = mean_z + 1.96 * se,
+    .groups = "drop"
+  )
+
+# Export output
+write_csv(source_summary, "output/all_sources_bias.csv")
+
+# Helper dataframe for horizontal guide lines
+hline_df <- source_summary %>%
+  distinct(predictor_clean) %>%
+  mutate(y = as.numeric(predictor_clean))
+
+# Plot all three data sources equally
+ggplot(
+  source_summary,
+  aes(
+    x = mean_z,
+    y = predictor_clean,
+    colour = source
+  )
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey85") +
+  geom_errorbarh(
+    aes(xmin = lower, xmax = upper),
+    position = position_dodge(width = 0.65),
+    height = 0.25,
+    linewidth = 0.5
+  ) +
+  geom_point(
+    position = position_dodge(width = 0.65),
+    size = 2.8
+  ) +
+  geom_hline(
+    data = hline_df,
+    aes(yintercept = y - 0.5),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    colour = "grey90",
+    linewidth = 0.3
+  ) +
+  scale_colour_manual(
+    values = c(
+      CS = "darkgoldenrod1",
+      Facebook = "blue",
+      Museum = "tomato"
+    )
+  ) +
+  labs(
+    x = "Weighted mean standardised predictor value",
+    y = NULL,
+    colour = "Data source"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 10),
+    legend.position = "top"
+  ) +
+  scale_y_discrete(expand = expansion(mult = c(0.03, 0.03)))
+
+# Export plot
+ggsave(
+  "output/figures/source_comparison_weighted_means.png",
+  width = 9,
+  height = 11,
+  dpi = 300
+)

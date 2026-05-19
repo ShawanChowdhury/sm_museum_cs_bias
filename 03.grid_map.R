@@ -8,11 +8,11 @@ library(tidyr)
 library(ggplot2)
 library(janitor)
 
-# Load and clean occurrence data
+# Import and clean occurrence data
 occ <- read_csv("data/com_data.csv", show_col_types = FALSE) %>% clean_names()
 analysis_df <- read_csv("output/analysis_df_speciesbased.csv", show_col_types = FALSE)
 
-### Use a standard CRS (metres), avoids km/metre confusion
+# Use a standard CRS (metres), avoids km/metre confusion
 crs_proj <- 32646  # EPSG:32646 (UTM zone 46N, metres)
 
 # Get polygon (Bangladesh + India only) and transform to UTM
@@ -124,10 +124,10 @@ ggplot() +
 ggsave("output/figures/spatial_bias_dist.png")
 
 ###############################################
-# Centroids as POINT geometry (one per grid cell)
+# Centroids as point geometry (one per grid cell)
 centroids_sf <- st_centroid(st_geometry(grid_map_plot))
 
-# Make an sf object with those centroids + your attributes
+# Make an sf object with those centroids & attributes
 centroids_tbl <- st_sf(
   grid_id      = grid_map_plot$grid_id,
   source_combo = grid_map_plot$source_combo,
@@ -230,4 +230,5 @@ ggplot(
     y = NULL
   )
 
+# Export plot
 ggsave("output/figures/spatial_bias_lat_lon.png")
